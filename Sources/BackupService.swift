@@ -3,8 +3,9 @@ import Foundation
 /// Exports and restores app configuration as a single portable JSON file, so a
 /// user moving to a new Mac can carry over their settings.
 ///
-/// Configuration is the only thing that lives outside the Recordings and
-/// Transcriptions folders. The user copies those two folders manually; the
+/// Configuration is the only thing that lives outside the Recordings,
+/// Transcriptions and Speakers folders. The user copies those folders manually
+/// (Speakers carries the voice library and its enrollment clips); the
 /// transcripts themselves come straight from the copied Transcriptions folder
 /// (read by `TranscriptionStore.loadAll()`), and each recording's audio link is
 /// auto-repaired on load by `TranscriptionStore.resolveRecordingURL` — which
@@ -41,6 +42,7 @@ enum BackupService {
         var minutesPromptsJSON: String?
         var selectedMinutesPromptID: String?
         var minutesContextTokens: Int?
+        var diarizationUseRemote: Bool?
     }
 
     // MARK: - Export
@@ -62,7 +64,9 @@ enum BackupService {
                 .flatMap { String(data: $0, encoding: .utf8) },
             selectedMinutesPromptID: d.string(forKey: MinutesPromptStore.selectedKey),
             minutesContextTokens: d.object(forKey: MinutesPromptStore.contextTokensKey) == nil
-                ? nil : d.integer(forKey: MinutesPromptStore.contextTokensKey)
+                ? nil : d.integer(forKey: MinutesPromptStore.contextTokensKey),
+            diarizationUseRemote: d.object(forKey: DiarizationService.useRemoteKey) == nil
+                ? nil : d.bool(forKey: DiarizationService.useRemoteKey)
         )
 
         return BackupFile(
@@ -113,6 +117,7 @@ enum BackupService {
         }
         set(c.selectedMinutesPromptID, MinutesPromptStore.selectedKey)
         if let tokens = c.minutesContextTokens { d.set(tokens, forKey: MinutesPromptStore.contextTokensKey) }
+        if let remote = c.diarizationUseRemote { d.set(remote, forKey: DiarizationService.useRemoteKey) }
         MinutesPromptStore.shared.reloadFromDefaults()
 
         // ModelManager caches the selection in a stored property; nudge it so the

@@ -226,9 +226,7 @@ struct DetailView: View {
     // MARK: - Copy & Export
 
     private func copyContent(_ item: TranscriptionItem) {
-        let text = item.segments.isEmpty
-            ? item.fullText
-            : item.segments.map { $0.text.trimmingCharacters(in: .whitespaces) }.joined(separator: "\n")
+        let text = plainTranscript(item)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
@@ -248,11 +246,16 @@ struct DetailView: View {
 
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            let text = item.segments.isEmpty
-                ? item.fullText
-                : item.segments.map { $0.text.trimmingCharacters(in: .whitespaces) }.joined(separator: "\n")
+            let text = plainTranscript(item)
             try? text.write(to: url, atomically: true, encoding: .utf8)
         }
+    }
+
+    /// One line per segment, prefixed with the speaker once the transcript has
+    /// been diarized. Shared by Copy and Export so both put out the same text.
+    private func plainTranscript(_ item: TranscriptionItem) -> String {
+        guard !item.segments.isEmpty else { return item.fullText }
+        return item.segments.map { SubtitleFormatter.speakerLine($0) }.joined(separator: "\n")
     }
 
     private func exportSubtitles(_ item: TranscriptionItem, format: SubtitleFormat) {
@@ -336,6 +339,7 @@ struct TranscribingView: View {
 
 struct TranscriptContentView: View {
     let item: TranscriptionItem
+    @Environment(AppState.self) var appState
     @Environment(AudioPlayerManager.self) var audioPlayer
     @State private var currentIndex: Int?
     @Binding var showSearch: Bool
@@ -353,6 +357,13 @@ struct TranscriptContentView: View {
         VStack(spacing: 0) {
             if showSearch {
                 searchBar
+            }
+            // The speaker panel belongs to the transcript itself, so it is hidden
+            // in the translation-only pane.
+            if !translationOnly, !item.segments.isEmpty {
+                SpeakerSummaryView(item: item)
+                    .padding(.horizontal)
+                    .padding(.top, 8)
             }
             transcriptScrollView
         }
@@ -581,6 +592,20 @@ struct SegmentRow: View {
             }
 
             VStack(alignment: .leading, spacing: 2) {
+                if !translationOnly, let speaker = segment.speakerDisplayName, !speaker.isEmpty {
+                    HStack(spacing: 5) {
+                        if let colorHex = segment.speakerColor,
+                           let nsColor = NSColor(hexString: colorHex) {
+                            Circle()
+                                .fill(Color(nsColor: nsColor))
+                                .frame(width: 8, height: 8)
+                        }
+                        Text(speaker)
+                            .font(.system(.caption, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 if !translationOnly {
                     highlightedText(segment.text.trimmingCharacters(in: .whitespaces))
                         .font(fontSize.bodyFont)

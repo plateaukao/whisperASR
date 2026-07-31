@@ -37,7 +37,7 @@ enum SubtitleFormatter {
     static func makeSRT(_ segments: [TranscriptionSegment]) -> String {
         var out = ""
         for (i, seg) in segments.enumerated() {
-            let line = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let line = speakerLine(seg)
             out += "\(i + 1)\n"
             out += "\(srtTime(seg.start)) --> \(srtTime(seg.end ?? seg.start))\n"
             out += "\(line)\n\n"
@@ -48,7 +48,7 @@ enum SubtitleFormatter {
     static func makeVTT(_ segments: [TranscriptionSegment]) -> String {
         var out = "WEBVTT\n\n"
         for seg in segments {
-            let line = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let line = speakerLine(seg)
             out += "\(vttTime(seg.start)) --> \(vttTime(seg.end ?? seg.start))\n"
             out += "\(line)\n\n"
         }
@@ -61,7 +61,7 @@ enum SubtitleFormatter {
     static func makeSUB(_ segments: [TranscriptionSegment], title: String = "") -> String {
         var out = "[INFORMATION]\n[TITLE]\(title)\n[END INFORMATION]\n\n"
         for seg in segments {
-            let line = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let line = speakerLine(seg)
             out += "\(subTime(seg.start)),\(subTime(seg.end ?? seg.start))\n"
             out += "\(line)\n\n"
         }
@@ -71,6 +71,17 @@ enum SubtitleFormatter {
     private static func clockParts(_ t: Double) -> (h: Int, m: Int, s: Int, ms: Int) {
         let total = Int((max(0, t) * 1000).rounded())
         return (total / 3_600_000, (total % 3_600_000) / 60_000, (total % 60_000) / 1000, total % 1000)
+    }
+
+    /// The segment's text, prefixed with the speaker when the transcript has been
+    /// diarized. Subtitles are the one export where "who said it" has to ride
+    /// along with the line itself, since there is no column to put it in.
+    static func speakerLine(_ seg: TranscriptionSegment) -> String {
+        let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let speaker = seg.speakerDisplayName, !speaker.isEmpty else {
+            return text
+        }
+        return "\(speaker): \(text)"
     }
 
     static func srtTime(_ t: Double) -> String {

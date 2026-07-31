@@ -9,6 +9,11 @@ struct SettingsView: View {
     @AppStorage("translationAPIKey") private var translationAPIKey = ""
     @AppStorage("translationModel") private var translationModel = ""
 
+    @AppStorage(DiarizationService.useRemoteKey) private var diarizationUseRemote = false
+    /// The voice library has no observable store, so the list is snapshotted when
+    /// Settings opens and kept in step as the user deletes from it.
+    @State private var knownSpeakers: [SpeakerProfile] = []
+
     // Local OpenAI-compatible API server
     @AppStorage(APIServer.enabledKey) private var apiServerEnabled = false
     @AppStorage(APIServer.portKey) private var apiServerPort = 8080
@@ -161,6 +166,46 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section("Speakers") {
+                Picker("Diarization Engine", selection: $diarizationUseRemote) {
+                    Text("On-device").tag(false)
+                    Text("OpenAI").tag(true)
+                }
+                .pickerStyle(.segmented)
+                Text(diarizationUseRemote
+                     ? "Uploads the recording to OpenAI's gpt-4o-transcribe-diarize (25 MB limit, at most 4 known voices per run) using the API key above. More accurate on crowded conversations."
+                     : "Identifies speakers entirely on this Mac using the Neural Engine. No key, no upload; the models download on first use.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if knownSpeakers.isEmpty {
+                    Text("No known voices yet. Name the speakers on a transcript and the app keeps a short clip of each one to recognize them next time.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(knownSpeakers) { speaker in
+                        HStack(spacing: 10) {
+                            Circle()
+                                .fill(Color(nsColor: NSColor(hexString: speaker.colorHex) ?? .systemGray))
+                                .frame(width: 10, height: 10)
+                            Text(speaker.name)
+                            Spacer()
+                            Text("\(speaker.recordingCount) recording\(speaker.recordingCount == 1 ? "" : "s")")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Button {
+                                SpeakerLibrary.deleteSpeaker(id: speaker.id)
+                                knownSpeakers = SpeakerLibrary.speakers
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Forget this voice and its samples")
+                        }
+                    }
+                }
+            }
+
             Section("Speech Recognition Models") {
                 ForEach(ModelCatalog.all) { model in
                     ModelRowView(model: model)
@@ -299,6 +344,9 @@ struct SettingsView: View {
             Button("Cancel", role: .cancel) { promptPendingDelete = nil }
         } message: {
             Text("The prompt text will be removed. This can't be undone.")
+        }
+        .onAppear {
+            knownSpeakers = SpeakerLibrary.speakers
         }
     }
 

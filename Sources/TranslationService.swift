@@ -64,6 +64,21 @@ enum TranslationError: LocalizedError {
 }
 
 enum TranslationService {
+    /// Builds a request URL from the user's configured endpoint (defaulting to
+    /// OpenAI), appending `path` unless the endpoint already ends with it. One
+    /// "OpenAI API" setting serves every consumer — translation, meeting minutes
+    /// and remote diarization — so the endpoint is derived in exactly one place.
+    static func apiURL(appending path: String) -> URL? {
+        let endpoint = (UserDefaults.standard.string(forKey: "translationEndpoint") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var base = endpoint.isEmpty ? "https://api.openai.com/v1" : endpoint
+        if !base.hasSuffix(path) {
+            if !base.hasSuffix("/") { base += "/" }
+            base += path
+        }
+        return URL(string: base)
+    }
+
     static func translateSegmentsWithOpenAI(
         segmentTexts: [String],
         targetLanguage: String,
@@ -71,18 +86,11 @@ enum TranslationService {
     ) async throws -> [String] {
         guard !segmentTexts.isEmpty else { return [] }
 
-        let endpoint = (UserDefaults.standard.string(forKey: "translationEndpoint") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let apiKey = UserDefaults.standard.string(forKey: "translationAPIKey") ?? ""
         let model = (UserDefaults.standard.string(forKey: "translationModel") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-
-        var baseURL = endpoint.isEmpty ? "https://api.openai.com/v1" : endpoint
-        if !baseURL.hasSuffix("/chat/completions") {
-            if !baseURL.hasSuffix("/") { baseURL += "/" }
-            baseURL += "chat/completions"
-        }
         let effectiveModel = model.isEmpty ? "gpt-4o-mini" : model
 
-        guard let url = URL(string: baseURL) else {
+        guard let url = apiURL(appending: "chat/completions") else {
             throw TranslationError.invalidEndpoint
         }
 

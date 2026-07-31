@@ -258,8 +258,6 @@ enum MeetingMinutesService {
     /// One chat-completion round-trip using the OpenAI API settings shared with
     /// translation (endpoint / key / model UserDefaults keys).
     private static func chat(system: String, user: String) async throws -> String {
-        let endpoint = (UserDefaults.standard.string(forKey: "translationEndpoint") ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
         let apiKey = UserDefaults.standard.string(forKey: "translationAPIKey") ?? ""
         let model = (UserDefaults.standard.string(forKey: "translationModel") ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -268,12 +266,7 @@ enum MeetingMinutesService {
             throw TranslationError.unavailable
         }
 
-        var baseURL = endpoint.isEmpty ? "https://api.openai.com/v1" : endpoint
-        if !baseURL.hasSuffix("/chat/completions") {
-            if !baseURL.hasSuffix("/") { baseURL += "/" }
-            baseURL += "chat/completions"
-        }
-        guard let url = URL(string: baseURL) else {
+        guard let url = TranslationService.apiURL(appending: "chat/completions") else {
             throw TranslationError.invalidEndpoint
         }
 
@@ -370,8 +363,10 @@ final class MinutesGenerator {
                 .components(separatedBy: .newlines)
                 .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         } else {
+            // speakerLine prefixes the speaker on diarized transcripts — who said
+            // what is exactly the kind of detail minutes need.
             lines = item.segments.map { seg in
-                "[\(Self.formatTimestamp(seg.start))] \(seg.text.trimmingCharacters(in: .whitespaces))"
+                "[\(Self.formatTimestamp(seg.start))] \(SubtitleFormatter.speakerLine(seg))"
             }
         }
         guard !lines.isEmpty else {

@@ -58,6 +58,10 @@ Native macOS SwiftUI app (macOS 14+, arm64) that transcribes audio using whisper
 
 - **Nemotron engine** (`NemotronEngine`): Actor wrapping FluidAudio's `StreamingNemotronMultilingualAsrManager` (Core ML on the Apple Neural Engine, [FluidAudio](https://github.com/FluidInference/FluidAudio) is the only other SPM dependency). Feeds 16 kHz mono PCM in 5 s slices for progress, then converts per-token RNNT timings into `TranscriptionSegment`s (splitting on sentence-final punctuation, >1.5 s gaps, or a 30 s cap). Language hints are locale codes ("zh-TW", "ja", nil = auto-detect); the detected locale is reported as an ISO-639-1 base code. Translation to English is whisper-only and returns an error on this engine. First-ever load triggers ANE compilation (minutes); afterwards the OS caches it and loads take ~1 s.
 
+- **Diarization** (`DiarizationProvider` / `DiarizationService`): Optional "who spoke when" pass run from the transcript view *after* transcription — never part of it. `DiarizationService.provider()` picks the engine from the `diarizationUseRemote` setting: `LocalDiarizationProvider` (FluidAudio's `DiarizerManager`, on-device, the default) or `OpenAIDiarizationProvider` (`gpt-4o-transcribe-diarize`, reusing the OpenAI API settings translation already uses). Providers return `SpeakerTurn`s; `assignSpeakers(to:turns:)` labels each `TranscriptionSegment` with the turn it overlaps the most, since whisper and the diarizer cut on different boundaries. Diarization models download from Hugging Face on first use.
+
+- **Voice library** (`SpeakerLibrary`, `VoiceSampleExtractor`, `SpeakerEmbeddingMatcher`): `@MainActor` JSON store in `~/Library/Application Support/WhisperASR/Speakers/` holding `SpeakerProfile`s and short WAV samples per speaker. Naming speakers in `SpeakerAssignmentView` creates the profiles and leaves behind a ~3 s clip of each voice; the next diarization enrolls those clips (`extractSpeakerEmbedding` → `initializeKnownSpeakers`) so recognized speakers come back named rather than numbered. Clusters the diarizer leaves unnamed get a second pass through `SpeakerEmbeddingMatcher` (cosine similarity over the 256-dim embeddings). Extraction is the expensive step, so embeddings are cached back onto the `VoiceSample`.
+
 - **State** (`AppState`): Single `@Observable` object injected via SwiftUI environment. Owns the `TranscriptionService` and the item collection. Orchestrates transcription lifecycle (add → transcribe → save, or retry/remove).
 
 - **Persistence** (`TranscriptionStore`): JSON file-per-item storage in `~/Library/Application Support/WhisperASR/Transcriptions/`. Saves on completion/failure/removal. Items mid-transcription at quit restore as "pending".
@@ -68,7 +72,7 @@ Native macOS SwiftUI app (macOS 14+, arm64) that transcribes audio using whisper
 
 ### UI structure
 
-`ContentView` is a `NavigationSplitView` with `SidebarView` (file list) + `DetailView` (status-dependent: progress/transcript/error) + `PlayerView` (audio controls, shown when a completed item is selected). `TranscriptContentView` syncs segment highlighting with audio playback position via `ScrollViewReader`.
+`ContentView` is a `NavigationSplitView` with `SidebarView` (file list) + `DetailView` (status-dependent: progress/transcript/error) + `PlayerView` (audio controls, shown when a completed item is selected). `TranscriptContentView` syncs segment highlighting with audio playback position via `ScrollViewReader`, and heads the transcript with `SpeakerSummaryView` (who spoke how much, plus the Diarize / Identify… actions that open `PreDiarizationView` and `SpeakerAssignmentView`).
 
 ### Model resolution
 
