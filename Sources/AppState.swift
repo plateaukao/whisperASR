@@ -101,6 +101,7 @@ class AppState {
     }
 
     func retranscribe(_ item: TranscriptionItem) {
+        cancelDiarization(for: item)
         item.segments = []
         item.fullText = ""
         item.progress = 0
@@ -279,11 +280,73 @@ class AppState {
         TranscriptionStore.save(item)
     }
 
+    // MARK: - Speaker Diarization
+
+    /// In-flight diarization passes by item id, so removing or re-transcribing an
+    /// item cancels its pass instead of letting it label a transcript that no
+    /// longer wants it.
+    private var diarizationTasks: [UUID: Task<Void, Never>] = [:]
+
+    /// Runs diarization over a finished transcript and labels its segments with
+    /// who spoke. Known voices are enrolled first so recognized speakers come back
+    /// named instead of numbered; `knownSpeakerIDs` narrows that to the people the
+    /// user said are in the recording — nil means the whole library, an empty
+    /// array means enroll nobody ("none of these people are present").
+    ///
+    /// @MainActor: `item` is observed by SwiftUI, so every mutation below must
+    /// land on the main actor; only the engine itself suspends off it.
+    @MainActor
+    func diarizeItem(_ item: TranscriptionItem, knownSpeakerIDs: [UUID]? = nil) {
+        guard !item.segments.isEmpty, !item.isDiarizing else { return }
+        item.isDiarizing = true
+        item.diarizationProgress = 0
+        item.diarizationError = nil
+
+        let knownSpeakers = SpeakerLibrary.knownSpeakerSamples(for: knownSpeakerIDs)
+        let provider = DiarizationService.provider()
+
+        diarizationTasks[item.id] = Task { @MainActor in
+            defer {
+                item.isDiarizing = false
+                item.diarizationProgress = 0
+                diarizationTasks[item.id] = nil
+            }
+            do {
+                let result = try await provider.diarize(
+                    audioURL: item.fileURL,
+                    knownSpeakers: knownSpeakers
+                ) { progress in
+                    Task { @MainActor in
+                        item.diarizationProgress = progress
+                    }
+                }
+                // Extraction is the slow part of enrollment; cache what this pass
+                // computed so the next one reuses it.
+                SpeakerLibrary.cacheEmbeddings(result.extractedEmbeddings)
+                item.segments = DiarizationService.assignSpeakers(to: item.segments,
+                                                                  turns: result.turns)
+                TranscriptionStore.save(item)
+            } catch is CancellationError {
+                // The item was removed or re-transcribed — nothing to report.
+            } catch {
+                print("[Diarization] \(provider.displayName) failed: \(error)")
+                item.diarizationError = error.localizedDescription
+                self.showToast("Couldn't identify speakers: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func cancelDiarization(for item: TranscriptionItem) {
+        diarizationTasks[item.id]?.cancel()
+        diarizationTasks[item.id] = nil
+    }
+
     func shutdown() {
         service.shutdown()
     }
 
     func removeItem(_ item: TranscriptionItem) {
+        cancelDiarization(for: item)
         items.removeAll { $0.id == item.id }
         TranscriptionStore.delete(item)
         if selectedItemID == item.id {

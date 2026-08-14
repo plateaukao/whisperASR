@@ -46,6 +46,25 @@ struct TranscriptionSegment: Codable, Equatable {
     let start: Double
     let end: Double?
     let text: String
+
+    // Speaker diarization. All optional, so transcripts saved before the feature
+    // existed still decode, and a transcript that was never diarized stays as it
+    // was.
+    /// The engine's own label for this speaker (e.g. "Speaker 1").
+    var diarizationLabel: String?
+    /// `SpeakerProfile.id`, set once the speaker is known to the voice library.
+    var speakerID: UUID?
+    /// The library's name for this speaker, once the user has named them.
+    var speakerName: String?
+    /// Hex color used for this speaker's dot in the transcript.
+    var speakerColor: String?
+
+    /// Name to show for this segment's speaker — the library's when known, else
+    /// the engine's label; nil when the transcript hasn't been diarized. Single
+    /// source of that precedence for the transcript view, exports and stats.
+    var speakerDisplayName: String? {
+        speakerName ?? diarizationLabel
+    }
 }
 
 // MARK: - Transcription Result
@@ -96,6 +115,13 @@ class TranscriptionItem: Identifiable {
     var translatedSegments: [String] = []
     var translationLanguage: String?
     var isTranslating: Bool = false
+    /// True while a diarization pass is running for this item.
+    var isDiarizing: Bool = false
+    /// Diarization progress (0...1) — covers the first-run model download too,
+    /// which can dwarf the pass itself (~100–200 MB plus ANE compilation).
+    var diarizationProgress: Double = 0
+    /// Why the last diarization pass failed, shown above the transcript.
+    var diarizationError: String?
     let dateAdded: Date
 
     init(fileURL: URL) {
