@@ -34,7 +34,7 @@ struct WhisperASRApp: App {
         }
         .defaultSize(width: 1000, height: 650)
 
-        Window("Select App to Record", id: "app-picker") {
+        Window("Record Audio", id: "app-picker") {
             AppPickerView()
                 .environment(appState)
                 .environment(audioPlayer)
@@ -144,7 +144,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Otherwise show the app picker
         openWindow(id: "app-picker")
-        bringWindowToFront(title: "Select App to Record")
+        bringWindowToFront(title: "Record Audio")
     }
 
     /// Find the named app and start recording automatically, skipping the picker.
@@ -171,7 +171,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         audioRecorder.availableApps = apps
                         audioRecorder.state = .ready
                         openWindow(id: "app-picker")
-                        self.bringWindowToFront(title: "Select App to Record")
+                        self.bringWindowToFront(title: "Record Audio")
                     }
                     return
                 }
@@ -186,7 +186,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 await MainActor.run {
                     audioRecorder.error = "Failed to list apps: \(error.localizedDescription)"
                     openWindow(id: "app-picker")
-                    self.bringWindowToFront(title: "Select App to Record")
+                    self.bringWindowToFront(title: "Record Audio")
                 }
             }
         }

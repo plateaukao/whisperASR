@@ -28,6 +28,14 @@ Native macOS SwiftUI app (macOS 14+, arm64) that transcribes audio using whisper
 
 - **API server** (`APIServer`): Optional OpenAI-compatible HTTP server (built on [FlyingFox](https://github.com/swhitty/FlyingFox), an SPM dependency). `APIServer.shared` is a `@MainActor @Observable` singleton that `AppState` injects its `TranscriptionService` into (via `attach`) so the model loads once and all requests serialize on the existing whisper queue. Serves `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, and `GET /v1/models`; supports `json`/`verbose_json`/`text`/`srt`/`vtt` response formats. Config (enable, port, optional bearer token, LAN binding) lives in UserDefaults / `SettingsView`; the token is read per-request so it takes effect without a restart, while port/LAN changes require toggling off and on. Multipart parsing is hand-rolled in `MultipartParser`.
 
+### Recording
+
+`AudioRecorder` uses a ScreenCaptureKit audio stream with either an inclusion filter for one app or an empty application exclusion filter for all system audio. Both exclude this process's playback. Only app-specific recordings start the Zoom meeting monitor. The same stream builder is used for initial capture and recovery.
+
+The microphone uses `AVAudioEngine` with optional native voice processing enabled before reading the device format; other-audio ducking is set to its minimum. Permission or engine startup failure leaves the recording dialog open with an error. Device format changes rebuild the microphone engine without resetting the recording timeline; a failed rebuild shows an error while system capture continues.
+
+A serial audio queue owns the writer, resampler, and `RecordingAudioMixer`. ScreenCaptureKit presentation timestamps and microphone host timestamps are placed on a shared monotonic 48 kHz timeline. A timer emits 20 ms blocks with 300 ms of delivery headroom, substituting silence for missing sources. Input is bounded to five seconds ahead; late samples are trimmed instead of shifting speech. The mixed signal is peak-limited before saving to M4A and feeding live transcription. Stopping drains queued input and flushes the delayed partial tail. Source, selected app, microphone, and echo-reduction preferences are included in settings backups.
+
 ### UI structure
 
 `ContentView` is a `NavigationSplitView` with `SidebarView` (file list) + `DetailView` (status-dependent: progress/transcript/error) + `PlayerView` (audio controls, shown when a completed item is selected). `TranscriptContentView` syncs segment highlighting with audio playback position via `ScrollViewReader`, and heads the transcript with `SpeakerSummaryView` (who spoke how much, plus the Diarize / Identify… actions that open `PreDiarizationView` and `SpeakerAssignmentView`).

@@ -10,30 +10,51 @@ enum RecordingState: Equatable {
     case idle
     case loading
     case ready
+    case starting
     case recording
     case saving
     case permissionDenied
+}
+
+enum RecordingSource: String, CaseIterable {
+    case system
+    case application
 }
 
 @Observable
 class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     var state: RecordingState = .idle
     var availableApps: [SCRunningApplication] = []
-    var selectedApp: SCRunningApplication?
+    var selectedApp: SCRunningApplication? {
+        didSet {
+            if let selectedApp {
+                UserDefaults.standard.set(selectedApp.bundleIdentifier, forKey: "recordingAppBundleID")
+            }
+        }
+    }
+    var recordingSource = RecordingSource(rawValue: UserDefaults.standard.string(forKey: "recordingSource") ?? "") ?? .system {
+        didSet { UserDefaults.standard.set(recordingSource.rawValue, forKey: "recordingSource") }
+    }
     var recordingDuration: TimeInterval = 0
     var error: String?
     var meetingEnded = false
-    var includeMicrophone = false
+    var includeMicrophone = UserDefaults.standard.object(forKey: "recordingIncludeMicrophone") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(includeMicrophone, forKey: "recordingIncludeMicrophone") }
+    }
+    var reduceSpeakerEcho = UserDefaults.standard.object(forKey: "recordingReduceSpeakerEcho") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(reduceSpeakerEcho, forKey: "recordingReduceSpeakerEcho") }
+    }
+    private(set) var recordingSourceName = ""
+    private(set) var microphoneStatus = ""
     var onMeetingEnded: (() -> Void)?
     var customRecordingName: String?
     var pinWindow = false
 
     private var stream: SCStream?
-    private var assetWriter: AVAssetWriter?
-    private var assetWriterInput: AVAssetWriterInput?
+    @ObservationIgnored private var assetWriter: AVAssetWriter?
+    @ObservationIgnored private var assetWriterInput: AVAssetWriterInput?
     private var timer: Timer?
     private var recordingStartTime: Date?
-    private var recordingAppName: String?
     private var outputURL: URL?
     private var _hasReceivedSamples = OSAllocatedUnfairLock(initialState: false)
     private var meetingMonitorTimer: Timer?
@@ -48,11 +69,18 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     /// How long without audio before we consider the stream stalled (seconds).
     private static let audioStallThreshold: TimeInterval = 15
 
-    // Microphone mixing
+    // The writer, mixer, resampler and timeline are confined to audioQueue.
+    private let audioQueue = DispatchQueue(label: "com.whisperasr.audio-capture")
+    private let activeStreamID = OSAllocatedUnfairLock(initialState: Optional<ObjectIdentifier>.none)
     private var audioEngine: AVAudioEngine?
-    private var micSampleBuffer = OSAllocatedUnfairLock(initialState: [Float]())
-    private var isMicActive = false
-    private static let maxMicBufferSamples = 48000 * 5 // 5 seconds cap
+    private var engineObserver: NSObjectProtocol?
+    @ObservationIgnored private var mixer: RecordingAudioMixer?
+    @ObservationIgnored private var mixTimer: DispatchSourceTimer?
+    @ObservationIgnored private var captureSessionID: UUID?
+    @ObservationIgnored private var timelineOrigin: TimeInterval = 0
+    @ObservationIgnored private var writeFailureReported = false
+    // Allow for microphone tap buffering and delivery jitter before emitting a block.
+    private static let mixingDelay: TimeInterval = 0.3
 
     // Live transcription: accumulated 16kHz mono PCM samples.
     // Buffer + trimOffset are in a single lock so reads/writes are always atomic.
@@ -219,6 +247,8 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
                 await MainActor.run {
                     self.availableApps = apps
+                    let savedID = UserDefaults.standard.string(forKey: "recordingAppBundleID")
+                    self.selectedApp = apps.first { $0.bundleIdentifier == savedID }
                     self.state = .ready
                 }
             } catch {
@@ -251,114 +281,147 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         UserDefaults.standard.set(recent, forKey: Self.recentAppsKey)
     }
 
-    func startRecording(app: SCRunningApplication) {
-        guard state == .ready else { return }
-        saveRecentApp(bundleID: app.bundleIdentifier)
+    var canStartRecording: Bool {
+        state == .ready && (recordingSource == .system || selectedApp != nil)
+    }
 
-        Task {
+    func startRecording() {
+        guard canStartRecording else { return }
+        startRecording(app: recordingSource == .system ? nil : selectedApp)
+    }
+
+    private func makeStream(display: SCDisplay, app: SCRunningApplication?) throws -> SCStream {
+        let filter: SCContentFilter
+        if let app {
+            filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+        } else {
+            filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+        }
+        let config = SCStreamConfiguration()
+        config.capturesAudio = true
+        config.excludesCurrentProcessAudio = true
+        config.channelCount = 1
+        config.sampleRate = 48000
+        config.width = 2
+        config.height = 2
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+        return stream
+    }
+
+    private static func captureError(_ message: String) -> NSError {
+        NSError(domain: "WhisperASR.Recording", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    private static var hostTime: TimeInterval {
+        CMClockGetTime(CMClockGetHostTimeClock()).seconds
+    }
+
+    func startRecording(app: SCRunningApplication?) {
+        guard state == .ready else { return }
+        state = .starting
+        error = nil
+        meetingEnded = false
+        let captureMicrophone = includeMicrophone
+        let echoReduction = reduceSpeakerEcho
+        let sessionID = UUID()
+        recordingSourceName = app?.applicationName ?? "All System Audio"
+        microphoneStatus = captureMicrophone ? "Microphone" : "Microphone off"
+
+        Task { @MainActor in
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
                 guard let display = content.displays.first else {
-                    await MainActor.run {
-                        self.error = "No display found"
-                    }
-                    return
+                    throw Self.captureError("No display found")
                 }
-
-                let filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
-
-                let config = SCStreamConfiguration()
-                config.capturesAudio = true
-                config.excludesCurrentProcessAudio = true
-                config.channelCount = 1
-                config.sampleRate = 48000
-                // Minimal video config (required but we don't need video)
-                config.width = 2
-                config.height = 2
-                config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-
-                let fileURL = self.makeOutputURL(appName: app.applicationName)
-                self.customRecordingName = nil
-
+                if captureMicrophone {
+                    guard AVCaptureDevice.default(for: .audio) != nil else {
+                        throw Self.captureError("No microphone is connected. Connect a microphone and select it in System Settings > Sound > Input, or turn off Microphone to record system audio only.")
+                    }
+                    let granted = await AVCaptureDevice.requestAccess(for: .audio)
+                    guard granted else {
+                        throw Self.captureError("Microphone access is denied. Allow WhisperASR in System Settings > Privacy & Security > Microphone, or turn off Microphone.")
+                    }
+                    try startMicrophoneCapture(sessionID: sessionID, reduceEcho: echoReduction)
+                    microphoneStatus = echoReduction ? "Microphone · Echo reduction on" : "Microphone · Echo reduction off"
+                }
+                let newStream = try makeStream(display: display, app: app)
+                let fileURL = makeOutputURL(appName: recordingSourceName)
                 let writer = try AVAssetWriter(outputURL: fileURL, fileType: .m4a)
-                let audioSettings: [String: Any] = [
+                outputURL = fileURL
+                let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
                     AVFormatIDKey: kAudioFormatMPEG4AAC,
                     AVSampleRateKey: 48000,
                     AVNumberOfChannelsKey: 1,
                     AVEncoderBitRateKey: 64000,
-                ]
-                let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+                ])
                 input.expectsMediaDataInRealTime = true
                 writer.add(input)
-                writer.startWriting()
+                guard writer.startWriting() else {
+                    throw writer.error ?? Self.captureError("Could not create the recording file")
+                }
                 writer.startSession(atSourceTime: .zero)
-
-                self.assetWriter = writer
-                self.assetWriterInput = input
-                self.outputURL = fileURL
-                self._hasReceivedSamples.withLock { $0 = false }
-                self.clearPCMBuffer()
-
-                self.recordingApp = app
-
-                let stream = SCStream(filter: filter, configuration: config, delegate: self)
-                try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "com.whisperasr.audio-capture"))
-                try await stream.startCapture()
-
-                self.stream = stream
-                self.recordingAppName = app.applicationName
-
-                if self.includeMicrophone {
-                    do {
-                        try self.startMicrophoneCapture()
-                    } catch {
-                        print("[AudioRecorder] failed to start microphone: \(error)")
-                        await MainActor.run {
-                            self.error = "Microphone unavailable, recording app audio only"
-                        }
-                    }
+                clearPCMBuffer()
+                _hasReceivedSamples.withLock { $0 = false }
+                audioQueue.sync {
+                    self.assetWriter = writer
+                    self.assetWriterInput = input
+                    self.pcmResampler?.reset()
+                    self.mixer = RecordingAudioMixer()
+                    self.captureSessionID = sessionID
+                    self.timelineOrigin = Self.hostTime
+                    self.writeFailureReported = false
                 }
-
-                await MainActor.run {
-                    self.state = .recording
-                    self.recordingDuration = 0
-                    self.recordingStartTime = Date()
-                    self.timer = Self.commonModeTimer(interval: 1.0) { [weak self] in
-                        guard let self, let start = self.recordingStartTime else { return }
-                        self.recordingDuration = Date().timeIntervalSince(start)
+                recordingStartTime = Date()
+                recordingApp = app
+                stream = newStream
+                activeStreamID.withLock { $0 = ObjectIdentifier(newStream) }
+                try await newStream.startCapture()
+                audioQueue.sync {
+                    let timer = DispatchSource.makeTimerSource(queue: self.audioQueue)
+                    timer.schedule(deadline: .now(), repeating: .milliseconds(20))
+                    timer.setEventHandler { [weak self] in
+                        self?.renderAudio(until: Self.hostTime - Self.mixingDelay)
                     }
-                    self.startMeetingMonitor(app: app)
-                    self.startAudioWatchdog()
+                    self.mixTimer = timer
+                    timer.resume()
                 }
+                customRecordingName = nil
+                if let app { saveRecentApp(bundleID: app.bundleIdentifier) }
+                state = .recording
+                recordingDuration = 0
+                timer = Self.commonModeTimer(interval: 1.0) { [weak self] in
+                    guard let self, let start = self.recordingStartTime else { return }
+                    self.recordingDuration = Date().timeIntervalSince(start)
+                }
+                if let app { startMeetingMonitor(app: app) }
+                startAudioWatchdog()
             } catch {
-                // Tear down whatever got as far as starting: cancel the writer,
-                // delete the stray output file, and drop the half-built stream so
-                // the next attempt starts from a clean slate.
-                if let stream = self.stream {
-                    try? await stream.stopCapture()
-                    self.stream = nil
+                activeStreamID.withLock { $0 = nil }
+                if let stream { try? await stream.stopCapture() }
+                stream = nil
+                stopMicrophoneCapture()
+                audioQueue.sync {
+                    self.endAudioTimeline()
+                    self.assetWriter?.cancelWriting()
+                    self.assetWriter = nil
+                    self.assetWriterInput = nil
                 }
-                if let writer = self.assetWriter {
-                    writer.cancelWriting()
-                }
-                self.assetWriter = nil
-                self.assetWriterInput = nil
-                if let url = self.outputURL {
-                    try? FileManager.default.removeItem(at: url)
-                    self.outputURL = nil
-                }
-                self.recordingApp = nil
-                self.recordingAppName = nil
-                await MainActor.run {
-                    self.error = "Failed to start recording: \(error.localizedDescription)"
-                }
+                if let url = outputURL { try? FileManager.default.removeItem(at: url) }
+                outputURL = nil
+                recordingApp = nil
+                self.error = "Failed to start recording: \(error.localizedDescription)"
+                state = .ready
             }
         }
     }
 
-    // MARK: - Stop Recording
+    // MARK: - Stop / Cancel Recording
 
     func stopRecording() async -> URL? {
+        let endTime = Self.hostTime
+        audioQueue.sync { self.mixTimer?.cancel(); self.mixTimer = nil }
         await MainActor.run {
             state = .saving
             timer?.invalidate()
@@ -366,230 +429,201 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             stopMeetingMonitor()
             stopAudioWatchdog()
         }
-
-        if let stream {
-            try? await stream.stopCapture()
-            self.stream = nil
-        }
-
+        if let stream { try? await stream.stopCapture() }
+        activeStreamID.withLock { $0 = nil }
+        self.stream = nil
         stopMicrophoneCapture()
+        // Flush the delayed tail before finishing the file. This also drains
+        // microphone callbacks already enqueued by the tap.
+        let writer: AVAssetWriter? = audioQueue.sync {
+            self.renderAudio(until: endTime, flush: true)
+            self.endAudioTimeline()
+            self.assetWriterInput?.markAsFinished()
+            return self.assetWriter
+        }
+        if let writer { await writer.finishWriting() }
+        let received = _hasReceivedSamples.withLock { $0 }
+        let url = writer?.status == .completed && received ? outputURL : nil
+        if url == nil, let outputURL { try? FileManager.default.removeItem(at: outputURL) }
+        audioQueue.sync {
+            self.assetWriter = nil
+            self.assetWriterInput = nil
+        }
         clearPCMBuffer()
         recordingApp = nil
-
-        let received = _hasReceivedSamples.withLock { $0 }
-        print("[AudioRecorder] stopRecording: hasReceivedSamples=\(received), writer=\(assetWriter != nil), input=\(assetWriterInput != nil)")
-
-        guard let writer = assetWriter, let input = assetWriterInput else {
-            assetWriter = nil
-            assetWriterInput = nil
-            if let url = outputURL {
-                try? FileManager.default.removeItem(at: url)
-            }
-            print("[AudioRecorder] stopRecording: no writer/input, returning nil")
-            return nil
-        }
-
-        input.markAsFinished()
-        await writer.finishWriting()
-
-        print("[AudioRecorder] stopRecording: writer.status=\(writer.status.rawValue), error=\(String(describing: writer.error))")
-
-        let url: URL?
-        if writer.status == .completed, received {
-            url = outputURL
-        } else {
-            url = nil
-            if let outputURL {
-                try? FileManager.default.removeItem(at: outputURL)
-            }
-        }
-        assetWriter = nil
-        assetWriterInput = nil
-
-        print("[AudioRecorder] stopRecording: returning url=\(String(describing: url))")
+        outputURL = nil
         return url
     }
 
-    // MARK: - Cancel Recording
-
     func cancelRecording() {
-        Task {
-            if let stream {
-                try? await stream.stopCapture()
-                self.stream = nil
+        guard state == .recording else { return }
+        state = .saving
+        timer?.invalidate()
+        timer = nil
+        stopMeetingMonitor()
+        stopAudioWatchdog()
+        audioQueue.sync { self.mixTimer?.cancel(); self.mixTimer = nil }
+        Task { @MainActor in
+            activeStreamID.withLock { $0 = nil }
+            if let stream { try? await stream.stopCapture() }
+            stream = nil
+            stopMicrophoneCapture()
+            audioQueue.sync {
+                self.endAudioTimeline()
+                self.assetWriter?.cancelWriting()
+                self.assetWriter = nil
+                self.assetWriterInput = nil
             }
-
-            self.stopMicrophoneCapture()
-            self.clearPCMBuffer()
-            self.recordingApp = nil
-
-            if let writer = assetWriter {
-                writer.cancelWriting()
-                if let url = outputURL {
-                    try? FileManager.default.removeItem(at: url)
-                }
-                assetWriter = nil
-                assetWriterInput = nil
-            }
-
-            await MainActor.run {
-                state = .ready
-                timer?.invalidate()
-                timer = nil
-                stopMeetingMonitor()
-                stopAudioWatchdog()
-                recordingDuration = 0
-            }
+            if let url = outputURL { try? FileManager.default.removeItem(at: url) }
+            outputURL = nil
+            clearPCMBuffer()
+            recordingApp = nil
+            state = .ready
+            recordingDuration = 0
         }
     }
 
     // MARK: - Microphone Capture
 
-    private func startMicrophoneCapture() throws {
+    private func startMicrophoneCapture(sessionID: UUID, reduceEcho: Bool) throws {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
+        if reduceEcho {
+            do {
+                try inputNode.setVoiceProcessingEnabled(true)
+                inputNode.voiceProcessingOtherAudioDuckingConfiguration = .init(
+                    enableAdvancedDucking: false, duckingLevel: .min)
+            } catch {
+                throw Self.captureError("Speaker echo reduction is unavailable: \(error.localizedDescription). Try turning off Reduce speaker echo.")
+            }
+        }
+        // Query AFTER enabling voice processing, which can change the format.
         let hwFormat = inputNode.outputFormat(forBus: 0)
-
-        // Target format matching SCStream output: 48kHz mono Float32
-        let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
-
-        let needsConversion = hwFormat.sampleRate != 48000 || hwFormat.channelCount != 1
-        var converter: AVAudioConverter?
-        if needsConversion {
-            converter = AVAudioConverter(from: hwFormat, to: targetFormat)
+        guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0,
+              let converter = AVAudioConverter(from: hwFormat, to: Self.pcmSourceFormat) else {
+            throw Self.captureError("No usable microphone input is available")
         }
-
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: hwFormat) { [weak self] buffer, _ in
-            guard let self else { return }
-
-            var samples: [Float]
-            if let converter {
-                let ratio = 48000.0 / hwFormat.sampleRate
-                let frameCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1
-                guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: frameCapacity) else { return }
-                var error: NSError?
-                var consumed = false
-                converter.convert(to: converted, error: &error) { _, outStatus in
-                    if consumed {
-                        outStatus.pointee = .noDataNow
-                        return nil
-                    }
-                    consumed = true
-                    outStatus.pointee = .haveData
-                    return buffer
-                }
-                guard error == nil, converted.frameLength > 0,
-                      let channelData = converted.floatChannelData?[0] else { return }
-                samples = Array(UnsafeBufferPointer(start: channelData, count: Int(converted.frameLength)))
-            } else {
-                guard let channelData = buffer.floatChannelData?[0] else { return }
-                samples = Array(UnsafeBufferPointer(start: channelData, count: Int(buffer.frameLength)))
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: hwFormat) { [weak self] buffer, time in
+            guard let self, time.isHostTimeValid else { return }
+            let timestamp = AVAudioTime.seconds(forHostTime: time.hostTime)
+            let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 48000 / hwFormat.sampleRate)) + 1
+            guard let converted = AVAudioPCMBuffer(pcmFormat: Self.pcmSourceFormat, frameCapacity: capacity) else { return }
+            var conversionError: NSError?
+            var consumed = false
+            converter.convert(to: converted, error: &conversionError) { _, status in
+                if consumed { status.pointee = .noDataNow; return nil }
+                consumed = true
+                status.pointee = .haveData
+                return buffer
             }
-
-            let capturedSamples = samples
-            self.micSampleBuffer.withLock { buf in
-                buf.append(contentsOf: capturedSamples)
-                // Cap buffer size to prevent unbounded growth
-                if buf.count > Self.maxMicBufferSamples {
-                    buf.removeFirst(buf.count - Self.maxMicBufferSamples)
-                }
+            guard conversionError == nil, converted.frameLength > 0,
+                  let data = converted.floatChannelData?[0] else { return }
+            let samples = Array(UnsafeBufferPointer(start: data, count: Int(converted.frameLength)))
+            self.audioQueue.async {
+                guard self.captureSessionID == sessionID else { return }
+                self.mixer?.append(samples, at: timestamp - self.timelineOrigin, source: .microphone)
             }
         }
-
-        engine.prepare()
-        try engine.start()
-        self.audioEngine = engine
-        self.isMicActive = true
+        do {
+            engine.prepare()
+            try engine.start()
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            engine.stop()
+            throw error
+        }
+        audioEngine = engine
+        engineObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self, weak engine] _ in
+            guard let self, let engine, self.audioEngine === engine, self.state == .recording else { return }
+            self.stopMicrophoneCapture()
+            do {
+                try self.startMicrophoneCapture(sessionID: sessionID, reduceEcho: reduceEcho)
+                self.error = nil
+            } catch {
+                self.microphoneStatus = "Microphone unavailable"
+                self.error = "Microphone stopped after an audio device change: \(error.localizedDescription). System audio is still recording."
+            }
+        }
     }
 
     private func stopMicrophoneCapture() {
-        guard isMicActive else { return }
+        if let engineObserver { NotificationCenter.default.removeObserver(engineObserver) }
+        engineObserver = nil
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
-        micSampleBuffer.withLock { $0.removeAll() }
-        isMicActive = false
     }
 
-    /// Creates a new CMSampleBuffer with mic audio mixed into the app audio.
-    /// Returns nil if mixing is not needed or fails — caller should use the original buffer.
-    private func mixedSampleBuffer(from original: CMSampleBuffer) -> CMSampleBuffer? {
-        guard isMicActive else { return nil }
-        guard let formatDesc = CMSampleBufferGetFormatDescription(original),
-              let blockBuffer = CMSampleBufferGetDataBuffer(original) else { return nil }
+    // MARK: - Audio Timeline (audioQueue only)
 
-        var totalLength = 0
-        var dataPointer: UnsafeMutablePointer<CChar>?
-        let status = CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
-        guard status == kCMBlockBufferNoErr, let dataPointer, totalLength > 0 else { return nil }
+    private func endAudioTimeline() {
+        mixTimer?.cancel()
+        mixTimer = nil
+        captureSessionID = nil
+        mixer = nil
+    }
 
-        // Copy original audio data
-        let sampleCount = totalLength / MemoryLayout<Float>.size
-        var floats = [Float](repeating: 0, count: sampleCount)
-        memcpy(&floats, dataPointer, totalLength)
-
-        // Read matching mic samples and mix
-        let micSamples = micSampleBuffer.withLock { buf -> [Float] in
-            let count = min(sampleCount, buf.count)
-            let result = Array(buf.prefix(count))
-            buf.removeFirst(count)
-            return result
+    private func renderAudio(until hostTime: TimeInterval, flush: Bool = false) {
+        guard let mixer, let input = assetWriterInput, !writeFailureReported else { return }
+        let endFrame = max(0, Int((hostTime - timelineOrigin) * 48000))
+        var position = mixer.nextFrame
+        while position < endFrame {
+            let count = min(RecordingAudioMixer.blockSize, endFrame - position)
+            if !flush && count < RecordingAudioMixer.blockSize { break }
+            guard input.isReadyForMoreMediaData else {
+                if assetWriter?.status == .failed || flush || endFrame - position > 48000 * 5 {
+                    reportWriteFailure("Recording could not keep up with saving audio. Finish this recording and check available disk space.")
+                }
+                return
+            }
+            guard let samples = self.mixer?.render(frameCount: count),
+                  let buffer = Self.makeAudioBuffer(samples, frame: position) else {
+                reportWriteFailure("Could not prepare audio for saving.")
+                return
+            }
+            guard input.append(buffer) else {
+                reportWriteFailure(assetWriter?.error?.localizedDescription ?? "Could not save recorded audio.")
+                return
+            }
+            _hasReceivedSamples.withLock { $0 = true }
+            accumulatePCMSamples(from: buffer)
+            position += count
         }
-        for i in 0..<micSamples.count {
-            let mixed = floats[i] + micSamples[i]
-            floats[i] = max(-1.0, min(1.0, mixed))
+    }
+
+    private func reportWriteFailure(_ message: String) {
+        writeFailureReported = true
+        DispatchQueue.main.async { self.error = message }
+    }
+
+    static func makeAudioBuffer(_ samples: [Float], frame: Int) -> CMSampleBuffer? {
+        var block: CMBlockBuffer?
+        let byteCount = samples.count * MemoryLayout<Float>.size
+        guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
+            blockLength: byteCount, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
+            offsetToData: 0, dataLength: byteCount, flags: 0, blockBufferOut: &block) == noErr,
+              let block else { return nil }
+        let status = samples.withUnsafeBytes {
+            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block,
+                                          offsetIntoDestination: 0, dataLength: byteCount)
         }
-
-        // Create new block buffer with mixed data
-        var newBlockBuffer: CMBlockBuffer?
-        var res = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: totalLength,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: totalLength,
-            flags: kCMBlockBufferAssureMemoryNowFlag,
-            blockBufferOut: &newBlockBuffer
-        )
-        guard res == kCMBlockBufferNoErr, let newBlockBuffer else { return nil }
-
-        res = floats.withUnsafeBytes { rawBuf in
-            CMBlockBufferReplaceDataBytes(
-                with: rawBuf.baseAddress!,
-                blockBuffer: newBlockBuffer,
-                offsetIntoDestination: 0,
-                dataLength: totalLength
-            )
-        }
-        guard res == kCMBlockBufferNoErr else { return nil }
-
-        // Create new sample buffer
-        let numSamples = CMSampleBufferGetNumSamples(original)
-        let pts = CMSampleBufferGetPresentationTimeStamp(original)
-
-        var newSampleBuffer: CMSampleBuffer?
-        res = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: newBlockBuffer,
-            formatDescription: formatDesc,
-            sampleCount: numSamples,
-            presentationTimeStamp: pts,
-            packetDescriptions: nil,
-            sampleBufferOut: &newSampleBuffer
-        )
-        guard res == noErr else { return nil }
-
-        return newSampleBuffer
+        guard status == noErr else { return nil }
+        var buffer: CMSampleBuffer?
+        guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault,
+            dataBuffer: block, formatDescription: Self.pcmSourceFormat.formatDescription,
+            sampleCount: samples.count, presentationTimeStamp: CMTime(value: Int64(frame), timescale: 48000),
+            packetDescriptions: nil, sampleBufferOut: &buffer) == noErr else { return nil }
+        return buffer
     }
 
     // MARK: - SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         print("[AudioRecorder] SCStream stopped with error: \(error)")
-        // Attempt to restart the stream automatically
-        restartStream()
+        guard activeStreamID.withLock({ $0 == ObjectIdentifier(stream) }) else { return }
+        DispatchQueue.main.async { self.restartStream() }
     }
 
     // MARK: - Audio Watchdog
@@ -629,50 +663,39 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private func restartStream() {
         guard state == .recording, !isRestartingStream else { return }
         isRestartingStream = true
+        let sessionID = audioQueue.sync { captureSessionID }
 
-        Task {
+        Task { @MainActor in
+            defer { isRestartingStream = false }
             // Stop the old stream
             if let oldStream = self.stream {
                 try? await oldStream.stopCapture()
                 self.stream = nil
             }
 
-            // Rebuild a fresh SCStream with the same app
-            guard let app = self.recordingApp else {
-                isRestartingStream = false
-                return
-            }
-
+            guard state == .recording, audioQueue.sync(execute: { captureSessionID == sessionID }) else { return }
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-                guard let display = content.displays.first else {
-                    isRestartingStream = false
+                guard state == .recording, audioQueue.sync(execute: { captureSessionID == sessionID }),
+                      let display = content.displays.first else { return }
+                let newStream = try makeStream(display: display, app: recordingApp)
+                self.stream = newStream
+                activeStreamID.withLock { $0 = ObjectIdentifier(newStream) }
+                try await newStream.startCapture()
+                guard state == .recording else {
+                    try? await newStream.stopCapture()
                     return
                 }
-
-                let filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
-
-                let config = SCStreamConfiguration()
-                config.capturesAudio = true
-                config.excludesCurrentProcessAudio = true
-                config.channelCount = 1
-                config.sampleRate = 48000
-                config.width = 2
-                config.height = 2
-                config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-
-                let newStream = SCStream(filter: filter, configuration: config, delegate: self)
-                try newStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "com.whisperasr.audio-capture"))
-                try await newStream.startCapture()
-                self.stream = newStream
                 self.lastAudioBufferTime.withLock { $0 = Date() }
 
                 print("[AudioRecorder] stream restarted successfully")
             } catch {
                 print("[AudioRecorder] stream restart failed: \(error)")
+                if state == .recording {
+                    self.error = "System audio capture interrupted: \(error.localizedDescription)"
+                }
             }
 
-            isRestartingStream = false
         }
     }
 
@@ -738,40 +761,22 @@ class AudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - SCStreamOutput
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio else { return }
-        guard sampleBuffer.isValid, sampleBuffer.numSamples > 0 else { return }
-
-        // Track that we're still receiving audio (for stall detection)
+        guard type == .audio, activeStreamID.withLock({ $0 == ObjectIdentifier(stream) }),
+              sampleBuffer.isValid, sampleBuffer.numSamples > 0,
+              let block = CMSampleBufferGetDataBuffer(sampleBuffer),
+              let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let format = CMAudioFormatDescriptionGetStreamBasicDescription(description) else { return }
+        // The stream is configured for mono 48 kHz Float32 PCM.
+        guard format.pointee.mSampleRate == 48000, format.pointee.mChannelsPerFrame == 1,
+              format.pointee.mBitsPerChannel == 32,
+              format.pointee.mFormatFlags & kAudioFormatFlagIsFloat != 0 else { return }
         lastAudioBufferTime.withLock { $0 = Date() }
-
-        // Use mixed buffer if mic is active, otherwise use original
-        let bufferToWrite = mixedSampleBuffer(from: sampleBuffer) ?? sampleBuffer
-
-        // Accumulate 16kHz PCM samples for live transcription
-        accumulatePCMSamples(from: bufferToWrite)
-
-        guard let input = assetWriterInput else {
-            print("[AudioRecorder] stream callback: no assetWriterInput")
-            return
+        var samples = [Float](repeating: 0, count: sampleBuffer.numSamples)
+        let status = samples.withUnsafeMutableBytes {
+            CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!)
         }
-        guard input.isReadyForMoreMediaData else {
-            print("[AudioRecorder] stream callback: input not ready")
-            return
-        }
-
-        let success = input.append(bufferToWrite)
-        if success {
-            let wasFirst = _hasReceivedSamples.withLock { val -> Bool in
-                let first = !val
-                val = true
-                return first
-            }
-            if wasFirst {
-                print("[AudioRecorder] first audio sample appended, numSamples=\(bufferToWrite.numSamples)")
-            }
-        } else {
-            print("[AudioRecorder] stream callback: append failed, writer.status=\(assetWriter?.status.rawValue ?? -1), error=\(String(describing: assetWriter?.error))")
-        }
+        guard status == noErr else { return }
+        mixer?.append(samples, at: sampleBuffer.presentationTimeStamp.seconds - timelineOrigin, source: .system)
     }
 
     /// Extracts Float32 samples from a CMSampleBuffer (48kHz) and resamples to 16kHz

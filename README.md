@@ -20,7 +20,7 @@ A native macOS app for audio transcription using [Breeze-ASR-25](https://github.
 
 ### Live transcription + translation
 
-- **App audio recording** — capture audio from any running app via ScreenCaptureKit (M4A/AAC at 48 kHz)
+- **System and app audio recording** — capture all system audio or a specific app via ScreenCaptureKit, optionally mixed with your microphone (M4A/AAC at 48 kHz); native speaker echo reduction helps when using built-in speakers
 - **Live transcription** — see transcribed text in real-time while recording
 - **Live translation** — per-segment translation displayed inline below each transcribed line, via OpenAI-compatible API
 - **Smart auto-scroll** — live transcription view automatically follows new segments
@@ -139,7 +139,7 @@ xattr -cr /path/to/WhisperASR.app
 ## Usage
 
 1. **Add files** — drag audio/video files onto the sidebar, or click the **+** button
-2. **Record app audio** — click the record button, select a running app, and start recording; recently used apps are listed first
+2. **Record audio** — click the record button and choose All System Audio or Specific App. Enable Microphone to include your voice and Reduce speaker echo when using speakers. The source, app, and microphone options are remembered. Microphone speech continues recording during system-audio silence; all-system mode includes other apps and notifications, excluding WhisperASR’s own playback. Echo reduction uses macOS voice processing and may slightly lower other playback audio; turn it off for an unprocessed microphone. Recently used apps are listed first in Specific App mode
 3. **Live transcription & translation** — enable live transcription in the recording dialog to see text as you record; set a target language in Settings to see inline translations below each segment
 4. **Wait for transcription** — files are queued and transcribed one at a time with progress and ETA
 5. **Review** — click a completed item to see the transcript with timestamps

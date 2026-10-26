@@ -19,6 +19,9 @@ struct AppPickerView: View {
                 loadingContent
             case .ready:
                 pickerContent
+            case .starting:
+                ProgressView("Starting recording…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .permissionDenied:
                 permissionDeniedContent
             default:
@@ -32,6 +35,12 @@ struct AppPickerView: View {
         .background(WindowPositioner())
         .onChange(of: appState.enableLiveTranscription) { _, newValue in
             if !newValue { appState.enableLiveTranslation = false }
+        }
+        .onChange(of: recorder.state) { _, state in
+            if state == .recording {
+                openWindow(id: "recording")
+                dismiss()
+            }
         }
         .onAppear {
             if recorder.state == .idle {
@@ -68,47 +77,70 @@ struct AppPickerView: View {
                     .padding(.bottom, 4)
             }
 
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("Search apps...", text: $searchText)
-                    .textFieldStyle(.plain)
-                if !searchText.isEmpty {
-                    Button {
-                        searchText = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
+            Picker("Audio source", selection: $recorder.recordingSource) {
+                Text("All System Audio").tag(RecordingSource.system)
+                Text("Specific App").tag(RecordingSource.application)
             }
-            .padding(6)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
-            .padding(.horizontal, 12)
-            .padding(.top, 12)
-            .padding(.bottom, 4)
+            .pickerStyle(.segmented)
+            .padding(12)
 
-            List(filteredApps, id: \.bundleIdentifier, selection: Binding(
-                get: { recorder.selectedApp?.bundleIdentifier },
-                set: { id in
-                    recorder.selectedApp = recorder.availableApps.first { $0.bundleIdentifier == id }
+            if recorder.recordingSource == .application {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Search apps...", text: $searchText)
+                        .textFieldStyle(.plain)
+                    if !searchText.isEmpty {
+                        Button {
+                            searchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
-            )) { app in
-                HStack(spacing: 10) {
-                    appIcon(for: app)
-                        .frame(width: 24, height: 24)
-                    Text(app.applicationName)
-                        .lineLimit(1)
+                .padding(6)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
+                .padding(.bottom, 4)
+
+                List(filteredApps, id: \.bundleIdentifier, selection: Binding(
+                    get: { recorder.selectedApp?.bundleIdentifier },
+                    set: { id in
+                        recorder.selectedApp = recorder.availableApps.first { $0.bundleIdentifier == id }
+                    }
+                )) { app in
+                    HStack(spacing: 10) {
+                        appIcon(for: app)
+                            .frame(width: 24, height: 24)
+                        Text(app.applicationName)
+                            .lineLimit(1)
+                    }
+                    .tag(app.bundleIdentifier)
                 }
-                .tag(app.bundleIdentifier)
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "speaker.wave.2.fill")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.secondary)
+                    Text("Record audio from all apps")
+                        .font(.headline)
+                    Text("Includes sounds from other apps and notifications. WhisperASR’s own playback is excluded.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
             Divider()
 
             HStack(spacing: 12) {
                 Toggle(isOn: $recorder.includeMicrophone) {
-                    Image(systemName: "mic")
+                    Label("Microphone", systemImage: "mic")
                 }
                 Toggle(isOn: $appState.enableLiveTranscription) {
                     Label("Live", systemImage: "text.word.spacing")
@@ -124,6 +156,15 @@ struct AppPickerView: View {
             .toggleStyle(.checkbox)
             .padding(.horizontal, 12)
             .padding(.top, 8)
+
+            if recorder.includeMicrophone {
+                Toggle("Reduce speaker echo", isOn: $recorder.reduceSpeakerEcho)
+                    .toggleStyle(.checkbox)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 6)
+                    .help("Uses macOS voice processing to reduce speaker sound picked up by the microphone. May slightly lower other audio; turn off for unprocessed microphone audio.")
+            }
 
             if appState.enableLiveTranscription {
                 HStack(spacing: 6) {
@@ -159,14 +200,10 @@ struct AppPickerView: View {
                 Spacer()
 
                 Button("Start Recording") {
-                    if let app = recorder.selectedApp {
-                        recorder.startRecording(app: app)
-                        openWindow(id: "recording")
-                        dismiss()
-                    }
+                    recorder.startRecording()
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(recorder.selectedApp == nil)
+                .disabled(!recorder.canStartRecording)
             }
             .padding(12)
         }

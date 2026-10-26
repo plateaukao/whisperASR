@@ -38,6 +38,10 @@ enum BackupService {
         var translationAPIKey: String?
         var liveTranslationPref: Bool?
         var recentRecordingApps: [String]?
+        var recordingSource: String?
+        var recordingAppBundleID: String?
+        var recordingIncludeMicrophone: Bool?
+        var recordingReduceSpeakerEcho: Bool?
         /// Meeting-minutes prompts as their raw JSON (the UserDefaults blob).
         var minutesPromptsJSON: String?
         var selectedMinutesPromptID: String?
@@ -63,6 +67,10 @@ enum BackupService {
             liveTranslationPref: d.object(forKey: "liveTranslationPref") == nil
                 ? nil : d.bool(forKey: "liveTranslationPref"),
             recentRecordingApps: d.stringArray(forKey: "recentRecordingApps"),
+            recordingSource: d.string(forKey: "recordingSource"),
+            recordingAppBundleID: d.string(forKey: "recordingAppBundleID"),
+            recordingIncludeMicrophone: d.object(forKey: "recordingIncludeMicrophone") as? Bool,
+            recordingReduceSpeakerEcho: d.object(forKey: "recordingReduceSpeakerEcho") as? Bool,
             minutesPromptsJSON: d.data(forKey: MinutesPromptStore.promptsKey)
                 .flatMap { String(data: $0, encoding: .utf8) },
             selectedMinutesPromptID: d.string(forKey: MinutesPromptStore.selectedKey),
@@ -121,6 +129,10 @@ enum BackupService {
         set(c.translationAPIKey, "translationAPIKey")
         if let pref = c.liveTranslationPref { d.set(pref, forKey: "liveTranslationPref") }
         if let apps = c.recentRecordingApps { d.set(apps, forKey: "recentRecordingApps") }
+        set(c.recordingSource, "recordingSource")
+        set(c.recordingAppBundleID, "recordingAppBundleID")
+        if let mic = c.recordingIncludeMicrophone { d.set(mic, forKey: "recordingIncludeMicrophone") }
+        if let echo = c.recordingReduceSpeakerEcho { d.set(echo, forKey: "recordingReduceSpeakerEcho") }
         if let prompts = c.minutesPromptsJSON?.data(using: .utf8) {
             d.set(prompts, forKey: MinutesPromptStore.promptsKey)
         }

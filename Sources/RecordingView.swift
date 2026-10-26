@@ -18,15 +18,21 @@ struct RecordingView: View {
                 recordingContent
             case .saving:
                 savingContent
+            case .starting:
+                ProgressView("Starting recording…")
+            case .ready:
+                if let error = recorder.error {
+                    Text(error).foregroundStyle(.red).padding()
+                }
             default:
                 Color.clear
             }
         }
         .frame(
             minWidth: 360, idealWidth: 420, maxWidth: .infinity,
-            minHeight: appState.enableLiveTranscription ? 200 : 44,
-            idealHeight: appState.enableLiveTranscription ? 300 : 44,
-            maxHeight: appState.enableLiveTranscription ? .infinity : 44
+            minHeight: appState.enableLiveTranscription ? 200 : 76,
+            idealHeight: appState.enableLiveTranscription ? 300 : 76,
+            maxHeight: appState.enableLiveTranscription || recorder.error != nil ? .infinity : 76
         )
         .background(WindowConfigurator())
     }
@@ -36,6 +42,24 @@ struct RecordingView: View {
     private var recordingContent: some View {
         @Bindable var recorder = recorder
         return VStack(spacing: 0) {
+            HStack {
+                Text(recorder.recordingSourceName)
+                    .lineLimit(1)
+                Spacer()
+                Text(recorder.microphoneStatus)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .font(.caption)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+            if let error = recorder.error {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(8)
+            }
             // Live transcription area (only shown if enabled)
             if appState.enableLiveTranscription {
                 liveTranscriptView
