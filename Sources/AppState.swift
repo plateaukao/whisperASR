@@ -366,6 +366,29 @@ class AppState {
         }
     }
 
+    /// Updates the default folder for auto-saved `.txt` transcriptions,
+    /// optionally migrating existing completed transcriptions from the previous
+    /// folder into the new one.
+    @MainActor
+    func changeExportFolder(to newDirectory: URL, migrateExisting: Bool) -> TranscriptionStore.MigrationResult {
+        let oldDirectory = TranscriptionStore.exportDirectory
+        TranscriptionStore.customExportFolderPath = newDirectory.path
+
+        if migrateExisting {
+            return TranscriptionStore.migrateExports(
+                items: items,
+                from: oldDirectory,
+                to: TranscriptionStore.exportDirectory
+            )
+        } else {
+            try? FileManager.default.createDirectory(
+                at: TranscriptionStore.exportDirectory,
+                withIntermediateDirectories: true
+            )
+            return TranscriptionStore.MigrationResult(migratedCount: 0, skippedCount: 0, failedCount: 0, firstError: nil)
+        }
+    }
+
     private func enqueueTranscription(for item: TranscriptionItem) {
         item.status = .pending
         if !isTranscribing {

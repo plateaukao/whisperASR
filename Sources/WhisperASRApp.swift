@@ -61,6 +61,7 @@ struct WhisperASRApp: App {
 
         Settings {
             SettingsView()
+                .environment(appState)
         }
     }
 }

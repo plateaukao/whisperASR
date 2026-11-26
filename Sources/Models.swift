@@ -139,6 +139,10 @@ class TranscriptionItem: Identifiable {
     var diarizationProgress: Double = 0
     /// Why the last diarization pass failed, shown above the transcript.
     var diarizationError: String?
+    /// Filename of the auto-saved plain-text transcript in the export folder
+    /// (e.g. "meeting.txt"), tracked so speaker updates, renames, and folder
+    /// migrations update the exact file without leaving duplicates behind.
+    var exportedTextFileName: String?
     let dateAdded: Date
 
     init(fileURL: URL) {
@@ -151,7 +155,8 @@ class TranscriptionItem: Identifiable {
     /// Restore from persisted data
     init(id: UUID, fileName: String, fileURL: URL, dateAdded: Date,
          status: TranscriptionStatus, segments: [TranscriptionSegment], fullText: String,
-         translatedSegments: [String] = [], translationLanguage: String? = nil) {
+         translatedSegments: [String] = [], translationLanguage: String? = nil,
+         exportedTextFileName: String? = nil) {
         self.id = id
         self.fileName = fileName
         self.fileURL = fileURL
@@ -161,5 +166,6 @@ class TranscriptionItem: Identifiable {
         self.fullText = fullText
         self.translatedSegments = translatedSegments
         self.translationLanguage = translationLanguage
+        self.exportedTextFileName = exportedTextFileName
     }
 }

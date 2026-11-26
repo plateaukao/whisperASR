@@ -50,6 +50,7 @@ enum BackupService {
         var diarizationUseOffline: Bool?
         var diarizationUseNemotron: Bool?
         var diarizationUseSpeakerKit: Bool?
+        var transcriptionExportFolderPath: String?
     }
 
     // MARK: - Export
@@ -83,7 +84,8 @@ enum BackupService {
             diarizationUseNemotron: d.object(forKey: DiarizationService.useNemotronKey) == nil
                 ? nil : d.bool(forKey: DiarizationService.useNemotronKey),
             diarizationUseSpeakerKit: d.object(forKey: DiarizationService.useSpeakerKitKey) == nil
-                ? nil : d.bool(forKey: DiarizationService.useSpeakerKitKey)
+                ? nil : d.bool(forKey: DiarizationService.useSpeakerKitKey),
+            transcriptionExportFolderPath: d.string(forKey: TranscriptionStore.exportFolderPathKey)
         )
 
         return BackupFile(
@@ -142,6 +144,7 @@ enum BackupService {
         if let speakerKit = c.diarizationUseSpeakerKit { d.set(speakerKit, forKey: DiarizationService.useSpeakerKitKey) }
         if let nemotron = c.diarizationUseNemotron { d.set(nemotron, forKey: DiarizationService.useNemotronKey) }
         if let offline = c.diarizationUseOffline { d.set(offline, forKey: DiarizationService.useOfflineKey) }
+        set(c.transcriptionExportFolderPath, TranscriptionStore.exportFolderPathKey)
         MinutesPromptStore.shared.reloadFromDefaults()
 
         // ModelManager caches the selection in a stored property; nudge it so the

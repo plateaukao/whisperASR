@@ -84,6 +84,14 @@ enum SubtitleFormatter {
         return "\(speaker): \(text)"
     }
 
+    /// Plain-text representation of a transcript: one line per segment, prefixed
+    /// with the speaker when diarized. Shared by Copy, manual Export, and
+    /// automatic `.txt` saving.
+    static func plainText(segments: [TranscriptionSegment], fallbackText: String) -> String {
+        guard !segments.isEmpty else { return fallbackText }
+        return segments.map { speakerLine($0) }.joined(separator: "\n")
+    }
+
     static func srtTime(_ t: Double) -> String {
         let p = clockParts(t)
         return String(format: "%02d:%02d:%02d,%03d", p.h, p.m, p.s, p.ms)

@@ -255,8 +255,7 @@ struct DetailView: View {
     /// One line per segment, prefixed with the speaker once the transcript has
     /// been diarized. Shared by Copy and Export so both put out the same text.
     private func plainTranscript(_ item: TranscriptionItem) -> String {
-        guard !item.segments.isEmpty else { return item.fullText }
-        return item.segments.map { SubtitleFormatter.speakerLine($0) }.joined(separator: "\n")
+        SubtitleFormatter.plainText(segments: item.segments, fallbackText: item.fullText)
     }
 
     private func exportSubtitles(_ item: TranscriptionItem, format: SubtitleFormat) {

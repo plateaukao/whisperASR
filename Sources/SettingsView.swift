@@ -2,7 +2,9 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SettingsView: View {
+    @Environment(AppState.self) private var appState
     @AppStorage("transcriptFontSize") private var transcriptFontSize = TranscriptFontSize.normal.rawValue
+    @AppStorage(TranscriptionStore.exportFolderPathKey) private var exportFolderPath = ""
     @AppStorage("modelPath") private var modelPath = ""
     @AppStorage("targetLanguage") private var targetLanguage = ""
     @AppStorage("translationEndpoint") private var translationEndpoint = ""
@@ -29,6 +31,10 @@ struct SettingsView: View {
     @State private var verifyInFlight = false
     @State private var verifyResult: VerifyResult? = nil
 
+    // Transcription export folder
+    @State private var pendingExportFolder: URL? = nil
+    @State private var exportFolderStatus: FolderStatus? = nil
+
     // Backup & restore
     @State private var backupStatus: BackupStatus? = nil
     @State private var pendingRestore: BackupService.BackupFile? = nil
@@ -50,6 +56,25 @@ struct SettingsView: View {
         case failure(String)
     }
 
+    private enum FolderStatus {
+        case success(String)
+        case failure(String)
+    }
+
+    private var currentExportDirectory: URL {
+        let trimmed = exportFolderPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return TranscriptionStore.defaultExportDirectory }
+        return URL(fileURLWithPath: trimmed, isDirectory: true)
+    }
+
+    private var isUsingDefaultExportFolder: Bool {
+        currentExportDirectory.standardizedFileURL == TranscriptionStore.defaultExportDirectory.standardizedFileURL
+    }
+
+    private var completedTranscriptionCount: Int {
+        appState.items.filter { $0.status == .completed }.count
+    }
+
     var body: some View {
         Form {
             Section("Appearance") {
@@ -59,6 +84,46 @@ struct SettingsView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+            }
+
+            Section("Transcriptions") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Save Folder")
+                    Text((currentExportDirectory.path as NSString).abbreviatingWithTildeInPath)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                }
+
+                HStack(spacing: 10) {
+                    Button("Choose…") { chooseExportFolder() }
+                    Button("Reveal in Finder") { revealExportFolder() }
+                    if !isUsingDefaultExportFolder {
+                        Button("Reset to Default") {
+                            requestExportFolderChange(to: TranscriptionStore.defaultExportDirectory)
+                        }
+                    }
+                    Spacer()
+                }
+
+                switch exportFolderStatus {
+                case .success(let msg):
+                    Label(msg, systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .font(.caption)
+                case .failure(let msg):
+                    Label(msg, systemImage: "xmark.circle.fill")
+                        .foregroundStyle(.red)
+                        .font(.caption)
+                        .lineLimit(2)
+                case .none:
+                    EmptyView()
+                }
+
+                Text("Completed transcriptions are automatically saved as plain text (.txt) in this folder and updated whenever speaker recognition changes.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Translation") {
@@ -361,6 +426,22 @@ struct SettingsView: View {
         .padding()
         .onAppear { ModelManager.shared.refresh() }
         .confirmationDialog(
+            "Migrate existing transcriptions?",
+            isPresented: Binding(
+                get: { pendingExportFolder != nil },
+                set: { if !$0 { pendingExportFolder = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Migrate") { applyExportFolderChange(migrate: true) }
+            Button("Don't Migrate") { applyExportFolderChange(migrate: false) }
+            Button("Cancel", role: .cancel) { pendingExportFolder = nil }
+        } message: {
+            let count = completedTranscriptionCount
+            let folderName = pendingExportFolder?.lastPathComponent ?? "the new folder"
+            Text("Do you want to move \(count) existing transcription\(count == 1 ? "" : "s") to \"\(folderName)\"? If you choose not to migrate, existing files will stay in the previous folder and only new or updated transcriptions will be saved to the new folder.")
+        }
+        .confirmationDialog(
             "Restore from backup?",
             isPresented: $showRestoreConfirm,
             titleVisibility: .visible
@@ -451,6 +532,59 @@ struct SettingsView: View {
             if response == .OK, let url = panel.url {
                 modelPath = url.path
             }
+        }
+    }
+
+    // MARK: - Transcription Folder
+
+    private func chooseExportFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = currentExportDirectory
+        panel.prompt = "Choose"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            requestExportFolderChange(to: url)
+        }
+    }
+
+    private func revealExportFolder() {
+        let dir = currentExportDirectory
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(dir)
+    }
+
+    private func requestExportFolderChange(to newURL: URL) {
+        guard newURL.standardizedFileURL != currentExportDirectory.standardizedFileURL else { return }
+        exportFolderStatus = nil
+        if completedTranscriptionCount > 0 {
+            pendingExportFolder = newURL
+        } else {
+            _ = appState.changeExportFolder(to: newURL, migrateExisting: false)
+            exportFolderStatus = .success("Default folder updated.")
+        }
+    }
+
+    private func applyExportFolderChange(migrate: Bool) {
+        guard let targetURL = pendingExportFolder else { return }
+        pendingExportFolder = nil
+        let result = appState.changeExportFolder(to: targetURL, migrateExisting: migrate)
+        if !migrate {
+            exportFolderStatus = .success("Default folder updated. Existing files were left in place.")
+        } else if result.failedCount == 0 {
+            if result.migratedCount == 0 && result.skippedCount > 0 {
+                exportFolderStatus = .success("All \(result.skippedCount) transcription\(result.skippedCount == 1 ? "" : "s") already up to date.")
+            } else if result.skippedCount > 0 {
+                exportFolderStatus = .success("Migrated \(result.migratedCount) transcription\(result.migratedCount == 1 ? "" : "s"), \(result.skippedCount) unchanged.")
+            } else {
+                exportFolderStatus = .success("Migrated \(result.migratedCount) transcription\(result.migratedCount == 1 ? "" : "s").")
+            }
+        } else {
+            let detail = result.firstError ?? "Unknown error"
+            exportFolderStatus = .failure("Migrated \(result.migratedCount), failed \(result.failedCount): \(detail)")
         }
     }
 
